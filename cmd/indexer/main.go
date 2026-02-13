@@ -27,17 +27,20 @@ func main() {
 	}
 	defer pool.Close()
 
-	migrationSQL, err := migrations.FS.ReadFile("001_init.sql")
-	if err != nil {
-		log.Fatalf("read migration file: %v", err)
+	for _, migFile := range []string{"001_init.sql", "002_tasks.sql"} {
+		migrationSQL, err := migrations.FS.ReadFile(migFile)
+		if err != nil {
+			log.Fatalf("read migration file %s: %v", migFile, err)
+		}
+		if err := store.RunMigrations(ctx, pool, string(migrationSQL)); err != nil {
+			log.Fatalf("migration %s failed: %v", migFile, err)
+		}
+		log.Printf("migration %s applied", migFile)
 	}
-	if err := store.RunMigrations(ctx, pool, string(migrationSQL)); err != nil {
-		log.Fatalf("migration failed: %v", err)
-	}
-	log.Println("migrations applied")
 
 	repo := store.NewPostgresRepo(pool)
-	router := api.NewRouter(repo, cfg.MaxBodyBytes)
+	taskRepo := store.NewPostgresTaskRepo(pool)
+	router := api.NewRouter(repo, taskRepo, cfg)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
