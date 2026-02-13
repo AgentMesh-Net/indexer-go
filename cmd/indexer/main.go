@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/AgentMesh-Net/indexer-go/internal/api"
+	"github.com/AgentMesh-Net/indexer-go/internal/chain"
 	"github.com/AgentMesh-Net/indexer-go/internal/config"
 	"github.com/AgentMesh-Net/indexer-go/internal/store"
 	"github.com/AgentMesh-Net/indexer-go/migrations"
@@ -41,6 +42,22 @@ func main() {
 	repo := store.NewPostgresRepo(pool)
 	taskRepo := store.NewPostgresTaskRepo(pool)
 	router := api.NewRouter(repo, taskRepo, cfg)
+
+	// B4: Start one watcher goroutine per configured chain
+	for _, chainCfg := range cfg.SupportedChains {
+		rpcURL, ok := cfg.RPCURLs[chainCfg.ChainID]
+		if !ok || rpcURL == "" {
+			log.Printf("no RPC URL configured for chain %d — watcher disabled", chainCfg.ChainID)
+			continue
+		}
+		w, err := chain.NewWatcher(rpcURL, chainCfg, taskRepo)
+		if err != nil {
+			log.Printf("failed to create watcher for chain %d: %v — skipping", chainCfg.ChainID, err)
+			continue
+		}
+		go w.Run(ctx)
+		log.Printf("chain watcher started for chain=%d contract=%s", chainCfg.ChainID, chainCfg.SettlementContract)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

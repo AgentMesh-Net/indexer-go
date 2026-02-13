@@ -33,6 +33,10 @@ type Config struct {
 
 	// Supported chains (JSON array)
 	SupportedChains []ChainConfig
+
+	// RPC URLs per chain for onchain event watching (JSON map: chain_id -> rpc_url)
+	// e.g. INDEXER_RPC_URLS='{"11155111":"wss://sepolia.infura.io/ws/v3/..."}'
+	RPCURLs map[int]string
 }
 
 // Load reads configuration from environment variables with defaults.
@@ -54,6 +58,7 @@ func Load() Config {
 
 		SupportedChains: parseChains(envOr("SUPPORTED_CHAINS_JSON",
 			`[{"chain_id":11155111,"settlement_contract":"0xf2223eA479736FA2c70fa0BB1430346D937C7C3C","min_confirmations":2}]`)),
+		RPCURLs: parseRPCURLs(envOr("INDEXER_RPC_URLS", "{}")),
 	}
 	return c
 }
@@ -75,6 +80,21 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func parseRPCURLs(raw string) map[int]string {
+	// Input JSON: {"11155111":"wss://..."}
+	var strMap map[string]string
+	if err := json.Unmarshal([]byte(raw), &strMap); err != nil {
+		return map[int]string{}
+	}
+	out := make(map[int]string, len(strMap))
+	for k, v := range strMap {
+		if n, err := strconv.Atoi(k); err == nil {
+			out[n] = v
+		}
+	}
+	return out
 }
 
 func parseChains(raw string) []ChainConfig {

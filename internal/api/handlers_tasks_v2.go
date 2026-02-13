@@ -21,29 +21,34 @@ import (
 	"github.com/go-chi/chi/v5"
 	"golang.org/x/crypto/sha3"
 
+	"github.com/AgentMesh-Net/indexer-go/internal/ethutil"
 	"github.com/AgentMesh-Net/indexer-go/internal/store"
 	"github.com/AgentMesh-Net/indexer-go/internal/util"
 )
 
 var reHexAddr = regexp.MustCompile(`(?i)^0x[0-9a-fA-F]{40}$`)
 var reHexHash = regexp.MustCompile(`(?i)^0x[0-9a-fA-F]{64}$`)
+var reHexSig  = regexp.MustCompile(`(?i)^0x[0-9a-fA-F]{130}$`) // 65 bytes = 130 hex chars
 
 // ── Request types ──────────────────────────────────────────────────────────────
 
 type createTaskReq struct {
-	TaskID          string `json:"task_id"`
-	Title           string `json:"title"`
-	ChainID         int    `json:"chain_id"`
-	AmountWei       string `json:"amount_wei"`
-	DeadlineUnix    int64  `json:"deadline_unix"`
-	EmployerAddress string `json:"employer_address"`
-	TaskHash        string `json:"task_hash"`
-	EscrowAddress   string `json:"escrow_address"`
+	TaskID          string         `json:"task_id"`
+	Title           string         `json:"title"`
+	ChainID         int            `json:"chain_id"`
+	AmountWei       string         `json:"amount_wei"`
+	DeadlineUnix    int64          `json:"deadline_unix"`
+	EmployerAddress string         `json:"employer_address"`
+	TaskHash        string         `json:"task_hash"`
+	EscrowAddress   string         `json:"escrow_address"`
+	Signature       string         `json:"signature"`   // required: EIP-191 personal_sign over keccak256(task_id)
+	Payload         map[string]any `json:"payload"`     // optional extra metadata
 }
 
 type acceptTaskReq struct {
 	AcceptID      string `json:"accept_id"`
 	WorkerAddress string `json:"worker_address"`
+	Signature     string `json:"signature"` // required: EIP-191 personal_sign over keccak256(task_id + accept_id)
 }
 
 // ── keccak256 helper ───────────────────────────────────────────────────────────
@@ -109,6 +114,25 @@ func (h *handlers) PostTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A1: Employer signature verification (EIP-191 personal_sign over keccak256(task_id))
+	if req.Signature == "" {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized", "signature is required")
+		return
+	}
+	if !reHexSig.MatchString(req.Signature) {
+		util.WriteError(w, http.StatusBadRequest, "invalid_request", "signature must be 0x + 130 hex chars")
+		return
+	}
+	if err := ethutil.VerifyPersonalSign([]byte(req.TaskID), req.Signature, req.EmployerAddress); err != nil {
+		if errors.Is(err, ethutil.ErrSignerMismatch) || errors.Is(err, ethutil.ErrInvalidSignature) {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized",
+				"signature verification failed: signer does not match employer_address")
+			return
+		}
+		util.WriteError(w, http.StatusBadRequest, "invalid_request", "signature error: "+err.Error())
+		return
+	}
+
 	// Validate chain_id is supported
 	escrow := req.EscrowAddress
 	chainOK := false
@@ -132,16 +156,17 @@ func (h *handlers) PostTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	task := &store.Task{
-		TaskID:          req.TaskID,
-		TaskHash:        strings.ToLower(req.TaskHash),
-		ChainID:         req.ChainID,
-		EscrowAddress:   escrow,
-		EmployerAddress: strings.ToLower(req.EmployerAddress),
-		AmountWei:       amtStr,
-		DeadlineUnix:    req.DeadlineUnix,
-		Title:           req.Title,
-		Status:          store.TaskStatusCreated,
-		IndexerFeeBPS:   h.cfg.FeeBPS,
+		TaskID:            req.TaskID,
+		TaskHash:          strings.ToLower(req.TaskHash),
+		ChainID:           req.ChainID,
+		EscrowAddress:     escrow,
+		EmployerAddress:   strings.ToLower(req.EmployerAddress),
+		EmployerSignature: strings.ToLower(req.Signature),
+		AmountWei:         amtStr,
+		DeadlineUnix:      req.DeadlineUnix,
+		Title:             req.Title,
+		Status:            store.TaskStatusCreated,
+		IndexerFeeBPS:     h.cfg.FeeBPS,
 	}
 
 	if err := h.taskRepo.InsertTask(r.Context(), task); err != nil {
@@ -243,6 +268,26 @@ func (h *handlers) PostTaskAccept(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A2: Worker signature verification (EIP-191 personal_sign over keccak256(task_id + accept_id))
+	if req.Signature == "" {
+		util.WriteError(w, http.StatusUnauthorized, "unauthorized", "signature is required")
+		return
+	}
+	if !reHexSig.MatchString(req.Signature) {
+		util.WriteError(w, http.StatusBadRequest, "invalid_request", "signature must be 0x + 130 hex chars")
+		return
+	}
+	workerSigMsg := []byte(taskID + req.AcceptID)
+	if err := ethutil.VerifyPersonalSign(workerSigMsg, req.Signature, req.WorkerAddress); err != nil {
+		if errors.Is(err, ethutil.ErrSignerMismatch) || errors.Is(err, ethutil.ErrInvalidSignature) {
+			util.WriteError(w, http.StatusUnauthorized, "unauthorized",
+				"signature verification failed: signer does not match worker_address")
+			return
+		}
+		util.WriteError(w, http.StatusBadRequest, "invalid_request", "signature error: "+err.Error())
+		return
+	}
+
 	// Verify task exists and is in created state
 	task, err := h.taskRepo.GetTask(r.Context(), taskID)
 	if err != nil {
@@ -260,9 +305,10 @@ func (h *handlers) PostTaskAccept(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accept := &store.Accept{
-		AcceptID:      req.AcceptID,
-		TaskID:        taskID,
-		WorkerAddress: strings.ToLower(req.WorkerAddress),
+		AcceptID:        req.AcceptID,
+		TaskID:          taskID,
+		WorkerAddress:   strings.ToLower(req.WorkerAddress),
+		WorkerSignature: strings.ToLower(req.Signature),
 	}
 	if err := h.taskRepo.InsertAccept(r.Context(), accept); err != nil {
 		if errors.Is(err, store.ErrConflict) {
@@ -289,7 +335,7 @@ func (h *handlers) PostTaskAccept(w http.ResponseWriter, r *http.Request) {
 // ── helper ─────────────────────────────────────────────────────────────────────
 
 func taskToMap(t *store.Task) map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"task_id":          t.TaskID,
 		"task_hash":        t.TaskHash,
 		"status":           t.Status,
@@ -304,4 +350,17 @@ func taskToMap(t *store.Task) map[string]any {
 		"created_at":       t.CreatedAt,
 		"updated_at":       t.UpdatedAt,
 	}
+	if t.OnchainCreatedAt != nil {
+		m["onchain_created_at"] = t.OnchainCreatedAt
+	}
+	if t.ReleasedAt != nil {
+		m["released_at"] = t.ReleasedAt
+	}
+	if t.RefundedAt != nil {
+		m["refunded_at"] = t.RefundedAt
+	}
+	if t.OnchainTxHash != "" {
+		m["onchain_tx_hash"] = t.OnchainTxHash
+	}
+	return m
 }
