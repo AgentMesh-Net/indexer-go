@@ -28,7 +28,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	for _, migFile := range []string{"001_init.sql", "002_tasks.sql"} {
+	for _, migFile := range []string{"001_init.sql", "002_tasks.sql", "003_onchain_sync.sql"} {
 		migrationSQL, err := migrations.FS.ReadFile(migFile)
 		if err != nil {
 			log.Fatalf("read migration file %s: %v", migFile, err)
